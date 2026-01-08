@@ -1,0 +1,116 @@
+{
+  "receptor_csv": "测试受体.csv",
+  "ligand_csv": "测试配体.csv",
+  "receptor_input_mode": "csv",
+  "ligand_input_mode": "csv",
+  "receptor_local_path": "",
+  "ligand_local_path": "",
+  "receptor_local_extensions": [".pdb", ".cif", ".mmcif"],
+  "ligand_local_extensions": [".pdb", ".mol", ".mol2", ".sdf", ".pdbqt"],
+  "local_recursive": true,
+  "local_extract_archives": true,
+  "local_ligand_add_hydrogens": true,
+  "local_ligand_gen3d": false,
+  "local_ligand_split_multimol_sdf": false,
+  "work_dir": "./docking_workspace",
+  "receptor_method": "openbabel",
+  "box_center": [0, 0, 0],
+  "box_size": [25, 25, 25],
+  "exhaustiveness": 8,
+  "num_modes": 9,
+  "energy_range": 3,
+  "cpu": 4,
+  "heatmap_colormap": "RdYlGn_r",
+  "receptor_cleanup": {
+    "enable": true,
+    "enable_altloc": true,
+    "remove_waters": true,
+    "remove_ions": true,
+    "remove_buffers": true,
+    "remove_organic_ligands": true,
+    "keep_hetero_resnames": []
+  },
+  "pdbfixer": {
+    "enable": true,
+    "add_missing_residues": true,
+    "add_missing_atoms": true,
+    "add_hydrogens": true,
+    "ph": 7.4
+  },
+  "comments": {
+    "receptor_csv": "受体CSV文件路径（相对或绝对路径）",
+    "ligand_csv": "配体CSV文件路径（相对或绝对路径）",
+    "receptor_input_mode": "受体输入模式：'csv' 或 'local'",
+    "ligand_input_mode": "配体输入模式：'csv' 或 'local'",
+    "receptor_local_path": "本地受体：文件夹/单文件/压缩包路径（local模式必填）",
+    "ligand_local_path": "本地配体：文件夹/单文件/压缩包路径（local模式必填）",
+    "receptor_local_extensions": "本地受体允许的扩展名列表（local模式）",
+    "ligand_local_extensions": "本地配体允许的扩展名列表（local模式）",
+    "local_recursive": "local模式下是否递归扫描子目录",
+    "local_extract_archives": "local模式下遇到zip/tar等压缩包是否自动解压",
+    "local_ligand_add_hydrogens": "local模式下配体转PDBQT时是否补氢（OpenBabel --addh）",
+    "local_ligand_gen3d": "local模式下配体转PDBQT时是否生成3D（OpenBabel --gen3d，必要时开启）",
+    "local_ligand_split_multimol_sdf": "local模式下SDF多分子是否拆分（OpenBabel -m，仅取拆分后第一个）",
+    "work_dir": "工作目录，存放所有对接相关文件",
+    "receptor_method": "受体准备方法: 'openbabel' 或 'meeko'（配体固定使用openbabel）",
+    "box_center": "对接盒子中心坐标 [x, y, z]，单位：埃(Å)",
+    "box_size": "对接盒子尺寸 [x, y, z]，单位：埃(Å)",
+    "exhaustiveness": "搜索精度(1-8)，越大越精确但越慢，推荐8",
+    "num_modes": "生成的对接构象数量，推荐9",
+    "energy_range": "能量范围(kcal/mol)，默认3",
+    "cpu": "使用的CPU核心数，默认4",
+    "heatmap_colormap": "热图配色方案，见下方预设列表或自定义",
+    "receptor_cleanup": "受体结构清理相关配置，例如是否删除水/离子/缓冲剂等",
+    "pdbfixer": "可选：使用PDBFixer补缺失残基/原子并加氢，需单独安装相关依赖"
+  },
+  "colormap_presets": {
+    "说明": "20种顶刊级配色预设，直接复制名称到heatmap_colormap使用",
+    "Nature系列": [
+      "RdYlGn_r",
+      "RdYlBu_r",
+      "viridis",
+      "plasma"
+    ],
+    "Science系列": [
+      "coolwarm",
+      "seismic",
+      "bwr",
+      "RdBu_r"
+    ],
+    "Cell系列": [
+      "YlOrRd",
+      "YlGnBu",
+      "PuRd",
+      "BuPu"
+    ],
+    "PNAS系列": [
+      "Spectral_r",
+      "RdYlGn",
+      "PRGn_r",
+      "PiYG_r"
+    ],
+    "其他高级配色": [
+      "turbo",
+      "cividis",
+      "inferno",
+      "magma"
+    ],
+    "自定义渐变": "可使用matplotlib支持的任何colormap名称，如：Blues, Reds, Greens等"
+  },
+  "how_to_set_box": {
+    "说明": "需要根据受体活性位点设置对接盒子",
+    "方法1": "使用PyMOL或Chimera打开受体PDB文件，找到活性位点坐标",
+    "方法2": "如果知道配体结合位置，使用该位置作为box_center",
+    "方法3": "使用整个蛋白质中心（较大的box_size如40x40x40）",
+    "示例": {
+      "活性位点已知": {
+        "box_center": [15.2, -3.5, 22.8],
+        "box_size": [20, 20, 20]
+      },
+      "全蛋白对接": {
+        "box_center": [0, 0, 0],
+        "box_size": [40, 40, 40]
+      }
+    }
+  }
+}
