@@ -32,7 +32,9 @@
    - macOS：
 
      ```bash
-     brew install open-babel vina
+     brew install open-babel
+
+     conda install -c conda-forge vina 
      ```
 
    - Linux (Ubuntu/Debian)：
@@ -42,7 +44,9 @@
      # Vina 请从官网 https://vina.scripps.edu/ 下载对应二进制并加入 PATH
      ```
 
-5. （建议）安装 PDBFixer + OpenMM 用于补残基/补侧链：
+   - Windows建议使用WSL，如使用原生系统可以使用AI工具辅助安装并配置环境
+
+6. （建议）安装 PDBFixer + OpenMM 用于补残基/补侧链：
 
    ```bash
    conda install -n docking_env -c conda-forge pdbfixer openmm
