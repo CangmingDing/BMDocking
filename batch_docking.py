@@ -44,6 +44,8 @@ class MolecularDocking:
         """
         self.config = self.load_config(config_file)
         self.work_dir = Path(self.config.get('work_dir', './docking_workspace'))
+
+        self._receptor_center_cache: Dict[str, List[float]] = {}
         
         # 创建分层目录结构
         self.receptor_raw_dir = self.work_dir / 'receptors' / 'raw'
@@ -810,6 +812,8 @@ class MolecularDocking:
             (pdb_file, pdbqt_file) 或 (None, None)
         """
         try:
+            smiles = str(smiles).strip().replace('\r', '').replace('\n', '')
+
             # 分别保存到raw和prepared目录
             pdb_file = self.ligand_raw_dir / f"{ligand_name}.pdb"
             pdbqt_file = self.ligand_prepared_dir / f"{ligand_name}.pdbqt"
@@ -821,33 +825,112 @@ class MolecularDocking:
             for f in [pdb_file, pdbqt_file]:
                 if os.path.exists(f):
                     os.remove(f)
-            
-            # SMILES -> 3D PDB (使用更安全的引号处理)
-            # 将SMILES用双引号包裹，避免shell解析问题
-            smiles_escaped = smiles.replace('"', '\\"')
-            cmd = f'obabel -:"{smiles_escaped}" -opdb -O "{pdb_file}" --gen3d --addh --minimize --steps 200 --ff MMFF94'
-            result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=120)
-            
-            if result.returncode != 0 or not os.path.exists(pdb_file) or os.path.getsize(pdb_file) == 0:
-                print(f"    OpenBabel生成3D结构失败")
-                if result.stderr:
-                    print(f"    错误信息: {result.stderr[:200]}")
-                return False
-            
-            # PDB -> PDBQT
-            cmd = f'obabel -ipdb "{pdb_file}" -opdbqt -O "{pdbqt_file}" -xn'
-            result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
-            
-            if result.returncode != 0 or not os.path.exists(pdbqt_file) or os.path.getsize(pdbqt_file) == 0:
-                print(f"    OpenBabel转换PDBQT失败")
-                if result.stderr:
-                    print(f"    错误信息: {result.stderr[:200]}")
+
+            large_smiles = len(smiles) >= 120
+            gen3d_timeout = int(self.config.get('ligand_openbabel_gen3d_timeout_sec', 300 if large_smiles else 120))
+            pdbqt_timeout = int(self.config.get('ligand_openbabel_pdbqt_timeout_sec', 60))
+
+            gen3d_attempts = [
+                ['obabel', f'-:{smiles}', '-opdbqt', '-O', pdbqt_file, '--gen3d', '--addh', '-xn'],
+                ['obabel', f'-:{smiles}', '-opdbqt', '-O', pdbqt_file, '--gen3d', '--addh', '--minimize', '--steps', '200', '--ff', 'MMFF94', '-xn'],
+                ['obabel', f'-:{smiles}', '-opdbqt', '-O', pdbqt_file, '--gen3d', '--addh', '--minimize', '--steps', '200', '--ff', 'UFF', '-xn'],
+            ]
+
+            last_err = ''
+            gen3d_ok = False
+            for cmd in gen3d_attempts:
+                try:
+                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=gen3d_timeout)
+                except subprocess.TimeoutExpired:
+                    last_err = f"gen3d timeout after {gen3d_timeout}s"
+                    continue
+
+                if result.returncode == 0 and os.path.exists(pdbqt_file) and os.path.getsize(pdbqt_file) > 0:
+                    gen3d_ok = True
+                    break
+                last_err = (result.stderr or result.stdout or '')[:400]
+
+            if not gen3d_ok:
+                print("    OpenBabel生成3D结构失败")
+                if last_err:
+                    print(f"    错误信息: {last_err}")
                 return None, None
             
+            cmd = ['obabel', '-ipdbqt', pdbqt_file, '-opdb', '-O', pdb_file]
+            subprocess.run(cmd, capture_output=True, text=True, timeout=pdbqt_timeout)
+
             return pdb_file, pdbqt_file
             
         except subprocess.TimeoutExpired:
             print(f"    处理超时（分子可能太复杂）")
+            return None, None
+
+    def smiles_to_3d_rdkit(self, smiles: str, ligand_name: str) -> tuple:
+        """使用RDKit生成3D构象，再用OpenBabel转为PDBQT"""
+        try:
+            smiles = str(smiles).strip().replace('\r', '').replace('\n', '')
+            if not smiles:
+                print("    SMILES为空")
+                return None, None
+
+            from rdkit import Chem
+            from rdkit.Chem import AllChem
+
+            pdb_file = self.ligand_raw_dir / f"{ligand_name}.pdb"
+            sdf_file = self.ligand_raw_dir / f"{ligand_name}.sdf"
+            pdbqt_file = self.ligand_prepared_dir / f"{ligand_name}.pdbqt"
+
+            pdb_file = str(pdb_file)
+            sdf_file = str(sdf_file)
+            pdbqt_file = str(pdbqt_file)
+
+            for f in [pdb_file, sdf_file, pdbqt_file]:
+                if os.path.exists(f):
+                    os.remove(f)
+
+            mol = Chem.MolFromSmiles(smiles)
+            if mol is None:
+                print("    无法解析SMILES")
+                return None, None
+
+            mol = Chem.AddHs(mol)
+
+            params = AllChem.ETKDGv3()
+            params.randomSeed = 42
+            embed_res = AllChem.EmbedMolecule(mol, params)
+            if embed_res != 0:
+                print("    生成3D坐标失败")
+                return None, None
+
+            if AllChem.MMFFHasAllMoleculeParams(mol):
+                AllChem.MMFFOptimizeMolecule(mol, maxIters=1000)
+            else:
+                AllChem.UFFOptimizeMolecule(mol, maxIters=2000)
+
+            Chem.MolToPDBFile(mol, pdb_file)
+            w = Chem.SDWriter(sdf_file)
+            w.write(mol)
+            w.close()
+
+            timeout_sec = int(self.config.get('ligand_rdkit_to_pdbqt_timeout_sec', 120))
+            cmd = ['obabel', '-isdf', sdf_file, '-opdbqt', '-O', pdbqt_file, '--addh', '-xn']
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_sec)
+            if result.returncode != 0 or (not os.path.exists(pdbqt_file)) or os.path.getsize(pdbqt_file) == 0:
+                err = (result.stderr or result.stdout or '')[:400]
+                if err:
+                    print(f"    RDKit->PDBQT失败: {err}")
+                return pdb_file if os.path.exists(pdb_file) else None, None
+
+            return pdb_file if os.path.exists(pdb_file) else None, pdbqt_file
+
+        except ImportError as e:
+            print(f"    缺少RDKit相关依赖: {e}")
+            return None, None
+        except subprocess.TimeoutExpired:
+            print("    RDKit->PDBQT超时（分子可能太复杂）")
+            return None, None
+        except Exception as e:
+            print(f"    RDKit处理失败: {e}")
             return None, None
         except Exception as e:
             print(f"    OpenBabel处理失败: {e}")
@@ -912,7 +995,7 @@ class MolecularDocking:
     
     def prepare_ligand(self, smiles: str, ligand_name: str) -> tuple:
         """
-        准备配体文件（固定使用OpenBabel）
+        准备配体文件（支持OpenBabel / RDKit / Meeko）
         
         Args:
             smiles: SMILES字符串
@@ -926,11 +1009,63 @@ class MolecularDocking:
         if not safe_name:
             safe_name = "ligand"
         
+        ligand_method = str(self.config.get('ligand_method', 'openbabel')).strip().lower()
+
+        if ligand_method == 'meeko':
+            print(f"正在准备配体: {ligand_name} (使用Meeko)...")
+            output_base = str(self.ligand_prepared_dir / safe_name)
+            ok = self.smiles_to_3d_meeko(smiles, output_base)
+            pdb_file = str(self.ligand_raw_dir / f"{safe_name}.pdb")
+            pdbqt_file = f"{output_base}.pdbqt"
+            if not ok or not os.path.exists(pdbqt_file):
+                print(f"  ✗ 配体准备失败")
+                return None, None
+            print(f"  ✓ 配体准备完成")
+            print(f"    Prepared: {pdbqt_file}")
+            return pdb_file if os.path.exists(pdb_file) else None, pdbqt_file
+
+        if ligand_method == 'rdkit':
+            print(f"正在准备配体: {ligand_name} (使用RDKit)...")
+            pdb_file, pdbqt_file = self.smiles_to_3d_rdkit(smiles, safe_name)
+            if pdbqt_file and os.path.exists(pdbqt_file):
+                print(f"  ✓ 配体准备完成")
+                if pdb_file:
+                    print(f"    Raw: {pdb_file}")
+                print(f"    Prepared: {pdbqt_file}")
+                return pdb_file, pdbqt_file
+            print(f"  ✗ 配体准备失败")
+            return None, None
+
         print(f"正在准备配体: {ligand_name} (使用OpenBabel)...")
-        
-        # 固定使用OpenBabel
+
         pdb_file, pdbqt_file = self.smiles_to_3d_openbabel(smiles, safe_name)
-        
+
+        if not pdbqt_file:
+            fallback_cfg = self.config.get('ligand_method_fallback', 'meeko')
+            if isinstance(fallback_cfg, (list, tuple)):
+                fallback_methods = [str(x).strip().lower() for x in fallback_cfg if str(x).strip()]
+            else:
+                fallback_methods = [m.strip().lower() for m in str(fallback_cfg).split(',') if m.strip()]
+
+            for method in fallback_methods:
+                if method == 'rdkit':
+                    print(f"  ⚠ OpenBabel失败，尝试使用RDKit回退...")
+                    pdb_file2, pdbqt2 = self.smiles_to_3d_rdkit(smiles, safe_name)
+                    if pdbqt2 and os.path.exists(pdbqt2):
+                        print(f"  ✓ 配体准备完成")
+                        print(f"    Prepared: {pdbqt2}")
+                        return pdb_file2, pdbqt2
+                elif method == 'meeko':
+                    print(f"  ⚠ OpenBabel失败，尝试使用Meeko回退...")
+                    output_base = str(self.ligand_prepared_dir / safe_name)
+                    ok = self.smiles_to_3d_meeko(smiles, output_base)
+                    pdbqt2 = f"{output_base}.pdbqt"
+                    if ok and os.path.exists(pdbqt2):
+                        print(f"  ✓ 配体准备完成")
+                        print(f"    Prepared: {pdbqt2}")
+                        pdb_file2 = str(self.ligand_raw_dir / f"{safe_name}.pdb")
+                        return pdb_file2 if os.path.exists(pdb_file2) else None, pdbqt2
+
         if pdbqt_file and os.path.exists(pdbqt_file):
             print(f"  ✓ 配体准备完成")
             print(f"    Raw: {pdb_file}")
@@ -939,6 +1074,83 @@ class MolecularDocking:
         else:
             print(f"  ✗ 配体准备失败")
             return None, None
+
+    def _compute_pdbqt_bounds(self, pdbqt_file: str) -> Optional[Tuple[float, float, float, float, float, float]]:
+        """计算PDBQT中所有原子坐标的包围盒"""
+        try:
+            min_x = min_y = min_z = float('inf')
+            max_x = max_y = max_z = float('-inf')
+            found = False
+
+            with open(pdbqt_file, 'r', encoding='utf-8', errors='ignore') as f:
+                for line in f:
+                    if not line.startswith(('ATOM', 'HETATM')):
+                        continue
+
+                    try:
+                        x = float(line[30:38])
+                        y = float(line[38:46])
+                        z = float(line[46:54])
+                    except Exception:
+                        parts = line.split()
+                        if len(parts) < 6:
+                            continue
+                        try:
+                            x = float(parts[5])
+                            y = float(parts[6])
+                            z = float(parts[7])
+                        except Exception:
+                            continue
+
+                    found = True
+                    min_x = min(min_x, x)
+                    min_y = min(min_y, y)
+                    min_z = min(min_z, z)
+                    max_x = max(max_x, x)
+                    max_y = max(max_y, y)
+                    max_z = max(max_z, z)
+
+            if not found:
+                return None
+            return min_x, max_x, min_y, max_y, min_z, max_z
+        except Exception:
+            return None
+
+    def _get_box_center_for_receptor(self, receptor_pdbqt: str) -> List[float]:
+        """获取指定受体的对接盒中心坐标（支持配置为auto自动计算）"""
+        center_cfg = self.config.get('box_center', [0, 0, 0])
+        if isinstance(center_cfg, (list, tuple)) and len(center_cfg) == 3:
+            try:
+                return [float(center_cfg[0]), float(center_cfg[1]), float(center_cfg[2])]
+            except Exception:
+                pass
+
+        if isinstance(center_cfg, str) and center_cfg.strip().lower() != 'auto':
+            try:
+                parts = [p.strip() for p in center_cfg.split(',')]
+                if len(parts) == 3:
+                    return [float(parts[0]), float(parts[1]), float(parts[2])]
+            except Exception:
+                pass
+
+        cache_key = os.path.abspath(receptor_pdbqt)
+        cached = self._receptor_center_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        bounds = self._compute_pdbqt_bounds(receptor_pdbqt)
+        if bounds is None:
+            center = [0.0, 0.0, 0.0]
+        else:
+            min_x, max_x, min_y, max_y, min_z, max_z = bounds
+            center = [
+                (min_x + max_x) / 2.0,
+                (min_y + max_y) / 2.0,
+                (min_z + max_z) / 2.0,
+            ]
+
+        self._receptor_center_cache[cache_key] = center
+        return center
     
     def run_vina_docking(self, receptor_pdbqt: str, ligand_pdbqt: str, 
                         receptor_name: str, ligand_name: str) -> Tuple[str, float]:
@@ -964,7 +1176,7 @@ class MolecularDocking:
         log_file = docking_dir / "docking_log.txt"
         
         # 构建Vina命令（注意：路径包含空格需要加引号）
-        center = self.config['box_center']
+        center = self._get_box_center_for_receptor(receptor_pdbqt)
         size = self.config['box_size']
         
         cmd = (
