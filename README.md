@@ -42,7 +42,7 @@
      # Vina 请从官网 https://vina.scripps.edu/ 下载对应二进制并加入 PATH
      ```
 
-5. （可选）安装 PDBFixer + OpenMM 用于补残基/补侧链：
+5. （建议）安装 PDBFixer + OpenMM 用于补残基/补侧链：
 
    ```bash
    conda install -n docking_env -c conda-forge pdbfixer openmm
