@@ -255,6 +255,23 @@ class MolecularDocking:
         if use_ligand_size:
             self._receptor_size_cache[cache_key] = size
 
+    def _receptor_display_name(self, receptor_name: str, receptor_id: str = '') -> str:
+        name = str(receptor_name).strip() if receptor_name is not None else ''
+        rid = str(receptor_id).strip() if receptor_id is not None else ''
+
+        if rid and name.endswith(f"_{rid}"):
+            base = name[:-(len(rid) + 1)].strip()
+            return base if base else name
+
+        parts = [p for p in name.split('_') if p != '']
+        if len(parts) >= 2:
+            last = parts[-1]
+            if len(last) == 4 and last.isalnum() and last[0].isdigit():
+                base = '_'.join(parts[:-1]).strip()
+                return base if base else name
+
+        return name
+
     def _read_receptor_protein_atoms_from_pdb(self, receptor_pdb: str) -> Optional[np.ndarray]:
         try:
             coords: List[Tuple[float, float, float]] = []
@@ -2047,8 +2064,10 @@ class MolecularDocking:
         total_dockings = len(receptors) * len(ligands)
         current = 0
 
+        pocket_enable = bool(self.config.get('pocket_enable', False))
+
         for receptor in receptors:
-            pockets = self._get_pockets_for_receptor(receptor['pdbqt'])
+            pockets = self._get_pockets_for_receptor(receptor['pdbqt']) if pocket_enable else None
             for ligand in ligands:
                 current += 1
                 parent_name = ligand.get('parent_name', ligand['name'])
@@ -2058,6 +2077,33 @@ class MolecularDocking:
                 else:
                     print(f"\n[{current}/{total_dockings}] 对接: {receptor['name']} vs {ligand_run_name}")
 
+                if not pocket_enable:
+                    output_dir, score = self.run_vina_docking(
+                        receptor['pdbqt'],
+                        ligand['pdbqt'],
+                        receptor['name'],
+                        ligand_run_name,
+                        receptor_id=receptor.get('id', ''),
+                    )
+
+                    if score is not None:
+                        print(f"  ✓ 对接完成，得分: {score:.2f} kcal/mol")
+                        print(f"    结果目录: {output_dir}")
+                        results.append({
+                            'Receptor': receptor['name'],
+                            'Receptor_ID': receptor.get('id', ''),
+                            'Ligand': parent_name,
+                            'Ligand_Variant': ligand_run_name if parent_name != ligand_run_name else '',
+                            'Ligand_SMILES': ligand.get('smiles', ''),
+                            'Pocket': '',
+                            'Pocket_Index': '',
+                            'Affinity': score,
+                            'Output_Dir': output_dir
+                        })
+                    else:
+                        print("  ✗ 对接失败或无法解析得分")
+                    continue
+
                 best_score = None
                 best_output_dir = None
                 best_pocket = None
@@ -2065,6 +2111,8 @@ class MolecularDocking:
 
                 if pockets and len(pockets) > 1:
                     print(f"  口袋数量: {len(pockets)}")
+                elif pockets and len(pockets) == 1 and str(pockets[0].get('name', '')).strip().lower() == 'single':
+                    print("  ⚠ 多口袋已启用，但未预测到更多口袋：回退为 single")
 
                 for pi, pocket in enumerate(pockets or []):
                     pocket_name = str(pocket.get('name', 'pocket'))
@@ -2383,12 +2431,33 @@ class MolecularDocking:
         print("正在绘制对接结果热图...")
 
         plot_df = results_df.copy()
-        plot_df['Receptor_Label'] = plot_df['Receptor']
+        if 'Receptor_ID' in plot_df.columns:
+            plot_df['Receptor_Key'] = plot_df.apply(
+                lambda r: (
+                    f"{str(r.get('Receptor', '')).strip()}_{str(r.get('Receptor_ID', '')).strip()}"
+                    if (str(r.get('Receptor_ID', '')).strip() and str(r.get('Receptor', '')).strip() and (str(r.get('Receptor', '')).strip() != str(r.get('Receptor_ID', '')).strip()) and (not str(r.get('Receptor', '')).strip().endswith(f"_{str(r.get('Receptor_ID', '')).strip()}")))
+                    else str(r.get('Receptor', '')).strip()
+                ),
+                axis=1
+            )
+            plot_df['Receptor_Label'] = plot_df.apply(
+                lambda r: self._receptor_display_name(r.get('Receptor', ''), r.get('Receptor_ID', '')),
+                axis=1
+            )
+        else:
+            plot_df['Receptor_Key'] = plot_df['Receptor'].astype(str).str.strip()
+            plot_df['Receptor_Label'] = plot_df['Receptor'].astype(str).apply(lambda x: self._receptor_display_name(x, ''))
 
-        # 创建数据透视表（遇到重复键时取最优亲和力）
+        key_to_label = (
+            plot_df[['Receptor_Key', 'Receptor_Label']]
+            .drop_duplicates(subset=['Receptor_Key'])
+            .set_index('Receptor_Key')['Receptor_Label']
+            .to_dict()
+        )
+
         pivot_data = plot_df.pivot_table(
             index='Ligand',
-            columns='Receptor_Label',
+            columns='Receptor_Key',
             values='Affinity',
             aggfunc='min'
         )
@@ -2402,7 +2471,7 @@ class MolecularDocking:
         colormap = self.config.get('heatmap_colormap', 'RdYlGn_r')
         
         # 绘制热图
-        sns.heatmap(
+        ax = sns.heatmap(
             pivot_data,
             annot=True,
             fmt='.2f',
@@ -2415,7 +2484,7 @@ class MolecularDocking:
         plt.title('Molecular Docking Results Heatmap', fontsize=16, fontweight='bold', pad=20)
         plt.xlabel('Receptor', fontsize=12, fontweight='bold')
         plt.ylabel('Ligand', fontsize=12, fontweight='bold')
-        plt.xticks(rotation=45, ha='right')
+        ax.set_xticklabels([key_to_label.get(str(x), str(x)) for x in pivot_data.columns], rotation=45, ha='right')
         plt.yticks(rotation=0)
         plt.tight_layout()
         
@@ -2444,7 +2513,10 @@ class MolecularDocking:
         plt.figure(figsize=(12, 6))
         
         # 创建标签
-        labels = [f"{row['Ligand']}\nvs\n{row['Receptor']}" for _, row in top_results.iterrows()]
+        labels = [
+            f"{row['Ligand']}\nvs\n{self._receptor_display_name(row.get('Receptor', ''), row.get('Receptor_ID', ''))}"
+            for _, row in top_results.iterrows()
+        ]
         
         colors = plt.cm.RdYlGn_r(np.linspace(0.3, 0.9, len(top_results)))
         
