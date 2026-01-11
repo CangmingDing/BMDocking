@@ -176,8 +176,8 @@ python batch_docking.py
 | `work_dir` | 工作目录 | `./hif1a` |
 | `receptor_input_mode` | 受体输入模式 | `csv` / `local` |
 | `ligand_input_mode` | 配体输入模式 | `csv` / `local` |
-| `receptor_csv` | 受体CSV（csv模式） | `hk2测试.csv` |
-| `ligand_csv` | 配体CSV（csv模式） | `瑞香素测试.csv` |
+| `receptor_csv` | 受体CSV（csv模式） | `受体测试.csv` |
+| `ligand_csv` | 配体CSV（csv模式） | `配体测试.csv` |
 | `receptor_local_path` | 本地受体路径（local模式） | `/path/to/receptors/raw` |
 | `ligand_local_path` | 本地配体路径（local模式） | `/path/to/ligands/raw` |
 | `box_center` | 对接盒中心 | `auto` 或 `[x,y,z]` |
