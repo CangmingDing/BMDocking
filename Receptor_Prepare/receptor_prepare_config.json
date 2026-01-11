@@ -1,0 +1,43 @@
+{
+  "mode": "local",
+  "receptor_csv": "测试受体.csv",
+  "receptor_local_path": "./hif1a/receptors/raw",
+  "work_dir": "./receptor_prepare_out",
+  "receptor_method": "openbabel",
+  "receptor_cif_to_pdb_fallback_enable": true,
+  "receptor_cif_to_pdb_preferred_tool": "gemmi",
+  "receptor_cif_to_pdb_openbabel_timeout_sec": 60,
+  "local_recursive": true,
+  "local_extract_archives": true,
+  "receptor_cleanup": {
+    "enable": true,
+    "enable_altloc": true,
+    "remove_waters": true,
+    "remove_ions": true,
+    "remove_buffers": true,
+    "remove_organic_ligands": true,
+    "keep_hetero_resnames": []
+  },
+  "pdbfixer": {
+    "enable": true,
+    "add_missing_residues": true,
+    "add_missing_atoms": true,
+    "add_hydrogens": true,
+    "ph": 7.4
+  },
+  "comments": {
+    "mode": "运行模式：local（处理本地结构文件/文件夹/压缩包）或 csv（按ID从RCSB下载）",
+    "receptor_csv": "csv模式下的受体表（至少包含列：ID；可选列：PRO）",
+    "receptor_local_path": "local模式下的输入路径（文件夹/单文件/压缩包）",
+    "work_dir": "输出工作目录（会生成 receptors/raw 与 receptors/prepared）",
+    "receptor_method": "受体转PDBQT方法：openbabel 或 meeko",
+    "receptor_cif_to_pdb_fallback_enable": "CIF→PDB 是否启用降级策略",
+    "receptor_cif_to_pdb_preferred_tool": "CIF→PDB 首选：openbabel/gemmi/openmm",
+    "receptor_cif_to_pdb_openbabel_timeout_sec": "OpenBabel CIF→PDB 最大允许时间（秒）",
+    "local_recursive": "local模式下是否递归扫描子目录",
+    "local_extract_archives": "local模式下遇到zip/tar等压缩包是否自动解压",
+    "receptor_cleanup": "是否清理水/离子/缓冲剂/其它异源小分子；可用 keep_hetero_resnames 强制保留",
+    "pdbfixer": "是否用PDBFixer补缺失残基/原子并按pH加氢（需安装pdbfixer/openmm）"
+  }
+}
+
