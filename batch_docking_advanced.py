@@ -35,7 +35,7 @@ plt.rcParams['axes.unicode_minus'] = False
 class MolecularDocking:
     """分子对接主类"""
     
-    def __init__(self, config_file: str = "docking_config.json"):
+    def __init__(self, config_file: str = "docking_config_advanced.json"):
         """
         初始化对接系统
         
@@ -46,6 +46,9 @@ class MolecularDocking:
         self.work_dir = Path(self.config.get('work_dir', './docking_workspace'))
 
         self._receptor_center_cache: Dict[str, List[float]] = {}
+        self._receptor_size_cache: Dict[str, List[float]] = {}
+        self._receptor_pdb_cache: Dict[str, str] = {}
+        self._receptor_pockets_cache: Dict[str, List[Dict]] = {}
         
         # 创建分层目录结构
         self.receptor_raw_dir = self.work_dir / 'receptors' / 'raw'
@@ -225,6 +228,264 @@ class MolecularDocking:
         safe = "".join(c for c in stem if c.isalnum() or c in (' ', '-', '_')).strip()
         return safe if safe else stem
 
+    def _cache_receptor_box_from_pdb(self, receptor_pdb: Path, receptor_pdbqt: Path) -> None:
+        center_cfg = self.config.get('box_center', 'auto')
+        size_cfg = self.config.get('box_size', None)
+        center_mode = str(center_cfg).strip().lower() if isinstance(center_cfg, str) else ''
+        size_mode = str(size_cfg).strip().lower() if isinstance(size_cfg, str) else ''
+
+        use_ligand_center = bool(self.config.get('box_auto_use_cocrystal_ligand', True)) and center_mode in (
+            'auto',
+            'auto_ligand',
+            'ligand',
+            'cocrystal',
+        )
+        use_ligand_size = size_mode in ('auto', 'auto_ligand', 'ligand', 'cocrystal')
+        if not (use_ligand_center or use_ligand_size):
+            return
+
+        inferred = self._infer_box_from_cocrystal_ligand(receptor_pdb)
+        if inferred is None:
+            return
+        center, size = inferred
+
+        cache_key = os.path.abspath(str(receptor_pdbqt))
+        if use_ligand_center:
+            self._receptor_center_cache[cache_key] = center
+        if use_ligand_size:
+            self._receptor_size_cache[cache_key] = size
+
+    def _read_receptor_protein_atoms_from_pdb(self, receptor_pdb: str) -> Optional[np.ndarray]:
+        try:
+            coords: List[Tuple[float, float, float]] = []
+            with open(receptor_pdb, 'r', encoding='utf-8', errors='ignore') as f:
+                for line in f:
+                    if not line.startswith('ATOM'):
+                        continue
+                    if len(line) < 54:
+                        continue
+                    try:
+                        x = float(line[30:38])
+                        y = float(line[38:46])
+                        z = float(line[46:54])
+                    except Exception:
+                        continue
+                    coords.append((x, y, z))
+            if not coords:
+                return None
+            return np.array(coords, dtype=float)
+        except Exception:
+            return None
+
+    def _cluster_pocket_centers(self, centers: List[List[float]], min_dist: float) -> List[List[float]]:
+        kept: List[List[float]] = []
+        for c in centers:
+            ok = True
+            for k in kept:
+                dx = c[0] - k[0]
+                dy = c[1] - k[1]
+                dz = c[2] - k[2]
+                if (dx * dx + dy * dy + dz * dz) <= (min_dist * min_dist):
+                    ok = False
+                    break
+            if ok:
+                kept.append(c)
+        return kept
+
+    def _predict_pockets_surface_random(self, receptor_pdb: str) -> List[Dict]:
+        atoms = self._read_receptor_protein_atoms_from_pdb(receptor_pdb)
+        if atoms is None or atoms.size == 0:
+            return []
+
+        n_points = int(self.config.get('pocket_random_points', 8000))
+        top_keep = int(self.config.get('pocket_top_points', 400))
+        dmin = float(self.config.get('pocket_dist_min', 2.5))
+        dmax = float(self.config.get('pocket_dist_max', 6.5))
+        chunk = int(self.config.get('pocket_distance_chunk', 200))
+        cluster_radius = float(self.config.get('pocket_cluster_radius', 8.0))
+        max_pockets = int(self.config.get('pocket_max_pockets', 5))
+        seed = int(self.config.get('pocket_random_seed', 42))
+
+        min_xyz = atoms.min(axis=0)
+        max_xyz = atoms.max(axis=0)
+        pad = float(self.config.get('pocket_bbox_pad', 4.0))
+        min_xyz = min_xyz - pad
+        max_xyz = max_xyz + pad
+
+        rng = np.random.default_rng(seed)
+        pts = rng.uniform(low=min_xyz, high=max_xyz, size=(n_points, 3)).astype(float)
+
+        min_dists = np.full((n_points,), np.inf, dtype=float)
+        for i in range(0, n_points, chunk):
+            p = pts[i:i + chunk]
+            diff = atoms[None, :, :] - p[:, None, :]
+            d2 = np.sum(diff * diff, axis=2)
+            min_dists[i:i + len(p)] = np.sqrt(np.min(d2, axis=1))
+
+        mask = (min_dists >= dmin) & (min_dists <= dmax)
+        if not np.any(mask):
+            return []
+
+        cand_pts = pts[mask]
+        cand_scores = min_dists[mask]
+        order = np.argsort(-cand_scores)
+        if order.size > top_keep:
+            order = order[:top_keep]
+        cand_pts = cand_pts[order]
+        cand_scores = cand_scores[order]
+
+        centers: List[List[float]] = []
+        for p in cand_pts:
+            centers.append([float(p[0]), float(p[1]), float(p[2])])
+        centers = self._cluster_pocket_centers(centers, min_dist=cluster_radius)
+        centers = centers[:max_pockets]
+
+        size_cfg = self.config.get('pocket_box_size', self.config.get('box_size_default', [35, 35, 35]))
+        if isinstance(size_cfg, (list, tuple)) and len(size_cfg) == 3:
+            try:
+                size = [float(size_cfg[0]), float(size_cfg[1]), float(size_cfg[2])]
+            except Exception:
+                size = [35.0, 35.0, 35.0]
+        else:
+            size = [35.0, 35.0, 35.0]
+
+        pockets: List[Dict] = []
+        for idx, c in enumerate(centers, start=1):
+            pockets.append({'name': f'surface_random_{idx}', 'center': c, 'size': size})
+        return pockets
+
+    def _get_pockets_for_receptor(self, receptor_pdbqt: str) -> List[Dict]:
+        key = os.path.abspath(str(receptor_pdbqt))
+        cached = self._receptor_pockets_cache.get(key)
+        if cached is not None:
+            return cached
+
+        pocket_enable = bool(self.config.get('pocket_enable', False))
+        if not pocket_enable:
+            pockets = [{'name': 'single', 'center': self._get_box_center_for_receptor(receptor_pdbqt), 'size': self._get_box_size_for_receptor(receptor_pdbqt)}]
+            self._receptor_pockets_cache[key] = pockets
+            return pockets
+
+        algos_cfg = self.config.get('pocket_algorithms', ['cocrystal', 'surface_random', 'receptor_center'])
+        if isinstance(algos_cfg, (list, tuple)):
+            algos = [str(x).strip().lower() for x in algos_cfg if str(x).strip()]
+        else:
+            algos = [x.strip().lower() for x in str(algos_cfg).split(',') if x.strip()]
+
+        pockets: List[Dict] = []
+        receptor_pdb = self._receptor_pdb_cache.get(key)
+
+        if 'cocrystal' in algos and receptor_pdb:
+            inferred = self._infer_box_from_cocrystal_ligand(Path(receptor_pdb))
+            if inferred is not None:
+                c, s = inferred
+                pockets.append({'name': 'cocrystal', 'center': c, 'size': s})
+
+        if 'surface_random' in algos and receptor_pdb:
+            pockets.extend(self._predict_pockets_surface_random(receptor_pdb))
+
+        if 'receptor_center' in algos:
+            pockets.append({'name': 'receptor_center', 'center': self._get_box_center_for_receptor(receptor_pdbqt), 'size': self._get_box_size_for_receptor(receptor_pdbqt)})
+
+        max_pockets = int(self.config.get('pocket_max_pockets', 5))
+        uniq: List[Dict] = []
+        seen = set()
+        for p in pockets:
+            c = p.get('center')
+            s = p.get('size')
+            if not c or not s:
+                continue
+            try:
+                ck = (round(float(c[0]), 1), round(float(c[1]), 1), round(float(c[2]), 1), round(float(s[0]), 1), round(float(s[1]), 1), round(float(s[2]), 1))
+            except Exception:
+                continue
+            if ck in seen:
+                continue
+            seen.add(ck)
+            uniq.append(p)
+            if len(uniq) >= max_pockets:
+                break
+
+        if not uniq:
+            uniq = [{'name': 'single', 'center': self._get_box_center_for_receptor(receptor_pdbqt), 'size': self._get_box_size_for_receptor(receptor_pdbqt)}]
+
+        self._receptor_pockets_cache[key] = uniq
+        return uniq
+
+    def _infer_box_from_cocrystal_ligand(self, receptor_pdb: Path) -> Optional[Tuple[List[float], List[float]]]:
+        if (not receptor_pdb.exists()) or receptor_pdb.stat().st_size == 0:
+            return None
+
+        keep_hetero = set(str(x).strip().upper() for x in (self.config.get('receptor_cleanup', {}) or {}).get('keep_hetero_resnames', []) if str(x).strip())
+        margin = float(self.config.get('box_auto_margin', 10.0))
+        min_size = float(self.config.get('box_auto_min_size', 18.0))
+        max_size = float(self.config.get('box_auto_max_size', 40.0))
+
+        water = {'HOH', 'WAT', 'H2O', 'DOD'}
+        ions = {
+            'NA', 'CL', 'K', 'CA', 'MG', 'ZN', 'MN', 'FE', 'CU', 'CO', 'NI', 'CD', 'HG', 'BR', 'I', 'F', 'CS', 'SR', 'BA'
+        }
+        buffers = {
+            'SO4', 'PO4', 'EDO', 'GOL', 'PEG', 'PG4', 'DMS', 'MPD', 'ACT', 'FMT', 'TRS', 'MES', 'HEP', 'BME', 'ACE', 'NAG'
+        }
+
+        groups: Dict[Tuple[str, str, str], List[Tuple[float, float, float]]] = {}
+        try:
+            with open(receptor_pdb, 'r', encoding='utf-8', errors='ignore') as f:
+                for line in f:
+                    if not line.startswith('HETATM'):
+                        continue
+                    if len(line) < 54:
+                        continue
+
+                    resname = line[17:20].strip().upper()
+                    chain = line[21].strip()
+                    resseq = line[22:26].strip()
+
+                    if resname in water:
+                        continue
+                    if resname in ions and resname not in keep_hetero:
+                        continue
+                    if resname in buffers and resname not in keep_hetero:
+                        continue
+
+                    try:
+                        x = float(line[30:38])
+                        y = float(line[38:46])
+                        z = float(line[46:54])
+                    except Exception:
+                        continue
+
+                    key = (resname, chain, resseq)
+                    groups.setdefault(key, []).append((x, y, z))
+        except Exception:
+            return None
+
+        if not groups:
+            return None
+
+        best_key = max(groups.keys(), key=lambda k: len(groups[k]))
+        coords = groups.get(best_key, [])
+        if not coords:
+            return None
+
+        xs = [c[0] for c in coords]
+        ys = [c[1] for c in coords]
+        zs = [c[2] for c in coords]
+
+        center = [float(sum(xs) / len(xs)), float(sum(ys) / len(ys)), float(sum(zs) / len(zs))]
+
+        dx = (max(xs) - min(xs)) + 2.0 * margin
+        dy = (max(ys) - min(ys)) + 2.0 * margin
+        dz = (max(zs) - min(zs)) + 2.0 * margin
+        size = [
+            float(min(max(dx, min_size), max_size)),
+            float(min(max(dy, min_size), max_size)),
+            float(min(max(dz, min_size), max_size)),
+        ]
+
+        return center, size
+
     def _looks_like_pdb(self, pdb_path: Path) -> bool:
         """快速判断文件是否像有效 PDB（非严格校验）"""
         if (not pdb_path.exists()) or pdb_path.stat().st_size == 0:
@@ -357,6 +618,8 @@ class MolecularDocking:
                 print(f"  ✗ 不支持的受体结构格式: {in_path.name}")
                 return None
 
+            self._cache_receptor_box_from_pdb(pdb_file, pdbqt_file)
+
             pdb_file = Path(self.preprocess_receptor_pdb(str(pdb_file)))
 
             if method.lower() == 'meeko':
@@ -386,6 +649,9 @@ class MolecularDocking:
                         print(f"  ✗ PDB转PDBQT失败: {result.stderr[:200]}")
                         return None
 
+            cache_key = os.path.abspath(str(pdbqt_file))
+            self._receptor_pdb_cache[cache_key] = str(pdb_file)
+            self._receptor_pockets_cache.pop(cache_key, None)
             print(f"  ✓ 受体准备完成: {pdbqt_file}")
             return str(pdbqt_file)
         except Exception as e:
@@ -533,6 +799,8 @@ class MolecularDocking:
                 print(f"  ✗ CIF转PDB失败: {msg[:200]}")
                 return None
 
+            self._cache_receptor_box_from_pdb(pdb_file, pdbqt_file)
+
             # 2. 对受体 PDB 进行预处理：ALTLOC、多构象、水/小分子清理、缺失残基/原子修补
             pdb_file = Path(self.preprocess_receptor_pdb(str(pdb_file)))
 
@@ -565,6 +833,9 @@ class MolecularDocking:
                         print(f"  ✗ PDB转PDBQT失败: {result.stderr[:200]}")
                         return None
             
+            cache_key = os.path.abspath(str(pdbqt_file))
+            self._receptor_pdb_cache[cache_key] = str(pdb_file)
+            self._receptor_pockets_cache.pop(cache_key, None)
             print(f"  ✓ 受体准备完成: {pdbqt_file}")
             return str(pdbqt_file)
             
@@ -1139,9 +1410,209 @@ class MolecularDocking:
             print(f"    缺少必要的库: {e}")
             print("    请安装: pip install rdkit meeko")
             return False
+
         except Exception as e:
             print(f"    Meeko处理失败: {e}")
             return False
+
+    def prepare_ligand_entries(self, smiles: str, ligand_name: str) -> List[Dict]:
+        safe_name = "".join(c for c in str(ligand_name) if c.isalnum() or c in (' ', '-', '_')).strip()
+        if not safe_name:
+            safe_name = "ligand"
+
+        enum_enable = bool(self.config.get('ligand_enumeration_enable', False))
+        if not enum_enable:
+            pdb_file, pdbqt_file = self.prepare_ligand(smiles, ligand_name)
+            if pdbqt_file:
+                return [{
+                    'name': safe_name,
+                    'parent_name': safe_name,
+                    'smiles': str(smiles).strip(),
+                    'pdb': pdb_file,
+                    'pdbqt': pdbqt_file
+                }]
+            return []
+
+        try:
+            from rdkit import Chem
+            from rdkit.Chem import AllChem
+        except Exception:
+            pdb_file, pdbqt_file = self.prepare_ligand(smiles, ligand_name)
+            if pdbqt_file:
+                return [{
+                    'name': safe_name,
+                    'parent_name': safe_name,
+                    'smiles': str(smiles).strip(),
+                    'pdb': pdb_file,
+                    'pdbqt': pdbqt_file
+                }]
+            return []
+
+        smiles_clean = str(smiles).strip().replace('\r', '').replace('\n', '')
+        if not smiles_clean:
+            return []
+
+        mol0 = Chem.MolFromSmiles(smiles_clean)
+        if mol0 is None:
+            return []
+
+        max_tautomers = int(self.config.get('ligand_enum_max_tautomers', 8))
+        max_conformers = int(self.config.get('ligand_enum_max_conformers', 10))
+        max_variants = int(self.config.get('ligand_enum_max_variants', 24))
+        prune_rms = float(self.config.get('ligand_enum_prune_rms_thresh', 0.5))
+        energy_window = float(self.config.get('ligand_enum_energy_window_kcal', 5.0))
+        random_seed = int(self.config.get('ligand_enum_random_seed', 42))
+        embed_confs = int(self.config.get('ligand_enum_embed_conformers', max(max_conformers * 2, 20)))
+        timeout_sec = int(self.config.get('ligand_rdkit_to_pdbqt_timeout_sec', 120))
+
+        lig_ph = self.config.get('ligand_ph', None)
+        ph_flag: List[str] = []
+        try:
+            if lig_ph is not None and str(lig_ph).strip() != '':
+                ph_flag = ['-p', str(float(lig_ph))]
+        except Exception:
+            ph_flag = []
+
+        tautomers: List['Chem.Mol'] = []
+        try:
+            from rdkit.Chem.MolStandardize import rdMolStandardize
+            enumerator = rdMolStandardize.TautomerEnumerator()
+            enumerated = enumerator.Enumerate(mol0)
+            tautomers = list(enumerated)
+        except Exception:
+            tautomers = [mol0]
+
+        seen = set()
+        uniq_tautomers: List['Chem.Mol'] = []
+        for m in tautomers:
+            try:
+                smi = Chem.MolToSmiles(m, isomericSmiles=True)
+            except Exception:
+                continue
+            if smi in seen:
+                continue
+            seen.add(smi)
+            uniq_tautomers.append(m)
+            if len(uniq_tautomers) >= max_tautomers:
+                break
+
+        prepared: List[Dict] = []
+        variant_no = 0
+        for t_idx, t_mol in enumerate(uniq_tautomers, start=1):
+            if variant_no >= max_variants:
+                break
+
+            m = Chem.AddHs(Chem.Mol(t_mol))
+
+            params = AllChem.ETKDGv3()
+            params.randomSeed = random_seed
+            params.pruneRmsThresh = prune_rms
+            try:
+                conf_ids = list(AllChem.EmbedMultipleConfs(m, numConfs=embed_confs, params=params))
+            except Exception:
+                conf_ids = []
+
+            if not conf_ids:
+                try:
+                    ok = AllChem.EmbedMolecule(m, params)
+                    conf_ids = [0] if ok == 0 else []
+                except Exception:
+                    conf_ids = []
+
+            if not conf_ids:
+                continue
+
+            energies: List[Tuple[int, float]] = []
+            try:
+                res = AllChem.MMFFOptimizeMoleculeConfs(m, numThreads=0, maxIters=500)
+                for cid, (status, e) in zip(conf_ids, res):
+                    if status == 0 and e is not None:
+                        energies.append((int(cid), float(e)))
+            except Exception:
+                energies = []
+
+            if not energies:
+                try:
+                    res = AllChem.UFFOptimizeMoleculeConfs(m, numThreads=0, maxIters=1000)
+                    for cid, (status, e) in zip(conf_ids, res):
+                        if status == 0 and e is not None:
+                            energies.append((int(cid), float(e)))
+                except Exception:
+                    energies = []
+
+            if energies:
+                energies.sort(key=lambda x: x[1])
+                best_e = energies[0][1]
+                selected = [x for x in energies if x[1] <= best_e + energy_window]
+                selected = selected[:max_conformers]
+                selected_conf_ids = [cid for cid, _ in selected]
+            else:
+                selected_conf_ids = [int(x) for x in conf_ids[:max_conformers]]
+
+            for c_idx, conf_id in enumerate(selected_conf_ids, start=1):
+                if variant_no >= max_variants:
+                    break
+
+                variant_no += 1
+                variant_suffix = f"__t{t_idx:02d}_c{c_idx:02d}"
+                variant_name = f"{safe_name}{variant_suffix}"
+
+                sdf_file = self.ligand_raw_dir / f"{variant_name}.sdf"
+                pdb_file = self.ligand_raw_dir / f"{variant_name}.pdb"
+                pdbqt_file = self.ligand_prepared_dir / f"{variant_name}.pdbqt"
+
+                for fp in [sdf_file, pdb_file, pdbqt_file]:
+                    try:
+                        if fp.exists():
+                            fp.unlink()
+                    except Exception:
+                        pass
+
+                try:
+                    writer = Chem.SDWriter(str(sdf_file))
+                    writer.write(m, confId=int(conf_id))
+                    writer.close()
+                except Exception:
+                    continue
+
+                try:
+                    Chem.MolToPDBFile(m, str(pdb_file), confId=int(conf_id))
+                except Exception:
+                    pdb_file = None
+
+                cmd = ['obabel', '-isdf', str(sdf_file), '-opdbqt', '-O', str(pdbqt_file), '--addh', '-xn']
+                if ph_flag:
+                    cmd = ['obabel', '-isdf', str(sdf_file), '-opdbqt', '-O', str(pdbqt_file)] + ph_flag + ['--addh', '-xn']
+                try:
+                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_sec)
+                    if result.returncode != 0 or (not pdbqt_file.exists()) or pdbqt_file.stat().st_size == 0:
+                        continue
+                except Exception:
+                    continue
+
+                prepared.append({
+                    'name': variant_name,
+                    'parent_name': safe_name,
+                    'smiles': smiles_clean,
+                    'pdb': str(pdb_file) if pdb_file and Path(pdb_file).exists() else None,
+                    'pdbqt': str(pdbqt_file)
+                })
+
+        if prepared:
+            print(f"正在准备配体: {ligand_name} (枚举模式)...")
+            print(f"  ✓ 生成 {len(prepared)} 个配体变体用于对接")
+            return prepared
+
+        pdb_file, pdbqt_file = self.prepare_ligand(smiles, ligand_name)
+        if pdbqt_file:
+            return [{
+                'name': safe_name,
+                'parent_name': safe_name,
+                'smiles': smiles_clean,
+                'pdb': pdb_file,
+                'pdbqt': pdbqt_file
+            }]
+        return []
     
     def prepare_ligand(self, smiles: str, ligand_name: str) -> tuple:
         """
@@ -1275,7 +1746,9 @@ class MolecularDocking:
             except Exception:
                 pass
 
-        if isinstance(center_cfg, str) and center_cfg.strip().lower() != 'auto':
+        center_mode = str(center_cfg).strip().lower() if isinstance(center_cfg, str) else ''
+
+        if isinstance(center_cfg, str) and center_mode not in ('auto', 'auto_ligand', 'ligand', 'cocrystal'):
             try:
                 parts = [p.strip() for p in center_cfg.split(',')]
                 if len(parts) == 3:
@@ -1301,9 +1774,51 @@ class MolecularDocking:
 
         self._receptor_center_cache[cache_key] = center
         return center
+
+    def _get_box_size_for_receptor(self, receptor_pdbqt: str) -> List[float]:
+        size_cfg = self.config.get('box_size', [20, 20, 20])
+        if isinstance(size_cfg, (list, tuple)) and len(size_cfg) == 3:
+            try:
+                return [float(size_cfg[0]), float(size_cfg[1]), float(size_cfg[2])]
+            except Exception:
+                pass
+
+        size_mode = str(size_cfg).strip().lower() if isinstance(size_cfg, str) else ''
+        if isinstance(size_cfg, str) and size_mode in ('auto', 'auto_ligand', 'ligand', 'cocrystal'):
+            cache_key = os.path.abspath(receptor_pdbqt)
+            cached = self._receptor_size_cache.get(cache_key)
+            if cached is not None:
+                return cached
+            default_size = self.config.get('box_size_default', [35, 35, 35])
+            if isinstance(default_size, (list, tuple)) and len(default_size) == 3:
+                try:
+                    return [float(default_size[0]), float(default_size[1]), float(default_size[2])]
+                except Exception:
+                    pass
+            return [35.0, 35.0, 35.0]
+
+        if isinstance(size_cfg, str):
+            try:
+                parts = [p.strip() for p in size_cfg.split(',')]
+                if len(parts) == 3:
+                    return [float(parts[0]), float(parts[1]), float(parts[2])]
+            except Exception:
+                pass
+
+        return [35.0, 35.0, 35.0]
     
-    def run_vina_docking(self, receptor_pdbqt: str, ligand_pdbqt: str, 
-                        receptor_name: str, ligand_name: str) -> Tuple[str, float]:
+    def run_vina_docking(
+        self,
+        receptor_pdbqt: str,
+        ligand_pdbqt: str,
+        receptor_name: str,
+        ligand_name: str,
+        receptor_id: str = '',
+        center: Optional[List[float]] = None,
+        size: Optional[List[float]] = None,
+        pocket_name: str = '',
+        pocket_index: Optional[int] = None,
+    ) -> Tuple[str, float]:
         """
         运行AutoDock Vina对接
         
@@ -1316,8 +1831,25 @@ class MolecularDocking:
         Returns:
             (输出目录路径, 最佳对接得分)
         """
-        # 为每个对接对创建独立目录
-        docking_dir = self.results_dir / f"{receptor_name}_vs_{ligand_name}"
+        receptor_storage = receptor_name
+        if str(receptor_id).strip() != '':
+            receptor_storage = f"{receptor_name}_{receptor_id}"
+
+        pair_dir = self.results_dir / f"{receptor_storage}_vs_{ligand_name}"
+        if pocket_name or (pocket_index is not None):
+            safe_pocket = "".join(c for c in str(pocket_name) if c.isalnum() or c in ('-', '_')).strip('_')
+            if not safe_pocket:
+                safe_pocket = 'pocket'
+            idx_tag = ''
+            if pocket_index is not None:
+                try:
+                    idx_tag = f"{int(pocket_index) + 1:02d}_"
+                except Exception:
+                    idx_tag = ''
+            docking_dir = pair_dir / f"pocket_{idx_tag}{safe_pocket}"
+        else:
+            docking_dir = pair_dir
+
         docking_dir.mkdir(parents=True, exist_ok=True)
         
         # 定义输出文件
@@ -1325,9 +1857,10 @@ class MolecularDocking:
         output_complex = docking_dir / "best_complex.pdb"
         log_file = docking_dir / "docking_log.txt"
         
-        # 构建Vina命令（注意：路径包含空格需要加引号）
-        center = self._get_box_center_for_receptor(receptor_pdbqt)
-        size = self.config['box_size']
+        if center is None:
+            center = self._get_box_center_for_receptor(receptor_pdbqt)
+        if size is None:
+            size = self._get_box_size_for_receptor(receptor_pdbqt)
         
         cmd = (
             f'vina --receptor "{receptor_pdbqt}" '
@@ -1382,7 +1915,15 @@ class MolecularDocking:
             summary_file = docking_dir / "summary.txt"
             with open(summary_file, 'w', encoding='utf-8') as f:
                 f.write(f"Receptor: {receptor_name}\n")
+                if str(receptor_id).strip() != '':
+                    f.write(f"Receptor_ID: {receptor_id}\n")
                 f.write(f"Ligand: {ligand_name}\n")
+                if pocket_name or (pocket_index is not None):
+                    f.write(f"Pocket: {pocket_name}\n")
+                    if pocket_index is not None:
+                        f.write(f"Pocket_Index: {pocket_index + 1}\n")
+                    f.write(f"Box_Center: {center[0]}, {center[1]}, {center[2]}\n")
+                    f.write(f"Box_Size: {size[0]}, {size[1]}, {size[2]}\n")
                 f.write(f"Best Affinity: {score} kcal/mol\n")
                 f.write(f"\nFiles Generated:\n")
                 f.write(f"  - docked_poses.pdbqt: All docking poses\n")
@@ -1507,33 +2048,93 @@ class MolecularDocking:
         current = 0
 
         for receptor in receptors:
+            pockets = self._get_pockets_for_receptor(receptor['pdbqt'])
             for ligand in ligands:
                 current += 1
-                print(f"\n[{current}/{total_dockings}] 对接: {receptor['name']} vs {ligand['name']}")
+                parent_name = ligand.get('parent_name', ligand['name'])
+                ligand_run_name = ligand['name']
+                if parent_name != ligand_run_name:
+                    print(f"\n[{current}/{total_dockings}] 对接: {receptor['name']} vs {parent_name} ({ligand_run_name})")
+                else:
+                    print(f"\n[{current}/{total_dockings}] 对接: {receptor['name']} vs {ligand_run_name}")
 
-                output_dir, score = self.run_vina_docking(
-                    receptor['pdbqt'],
-                    ligand['pdbqt'],
-                    receptor['name'],
-                    ligand['name']
-                )
+                best_score = None
+                best_output_dir = None
+                best_pocket = None
+                best_pocket_index = None
 
-                if score is not None:
-                    print(f"  ✓ 对接完成，得分: {score:.2f} kcal/mol")
-                    print(f"    结果目录: {output_dir}")
+                if pockets and len(pockets) > 1:
+                    print(f"  口袋数量: {len(pockets)}")
+
+                for pi, pocket in enumerate(pockets or []):
+                    pocket_name = str(pocket.get('name', 'pocket'))
+                    center = pocket.get('center')
+                    size = pocket.get('size')
+
+                    if pockets and len(pockets) > 1:
+                        print(f"  - Pocket {pi + 1}: {pocket_name}")
+
+                    output_dir, score = self.run_vina_docking(
+                        receptor['pdbqt'],
+                        ligand['pdbqt'],
+                        receptor['name'],
+                        ligand_run_name,
+                        receptor_id=receptor.get('id', ''),
+                        center=center,
+                        size=size,
+                        pocket_name=pocket_name,
+                        pocket_index=pi,
+                    )
+
+                    if score is None:
+                        if pockets and len(pockets) > 1:
+                            print("    ✗ 该口袋对接失败或无法解析得分")
+                        continue
+
+                    if pockets and len(pockets) > 1:
+                        print(f"    ✓ 得分: {score:.2f} kcal/mol")
+
+                    if (best_score is None) or (score < best_score):
+                        best_score = score
+                        best_output_dir = output_dir
+                        best_pocket = pocket_name
+                        best_pocket_index = pi + 1
+
+                if best_score is not None:
+                    print(f"  ✓ 最佳得分: {best_score:.2f} kcal/mol")
+                    print(f"    最佳结果目录: {best_output_dir}")
                     results.append({
                         'Receptor': receptor['name'],
                         'Receptor_ID': receptor.get('id', ''),
-                        'Ligand': ligand['name'],
-                        'Affinity': score,
-                        'Output_Dir': output_dir
+                        'Ligand': parent_name,
+                        'Ligand_Variant': ligand_run_name if parent_name != ligand_run_name else '',
+                        'Ligand_SMILES': ligand.get('smiles', ''),
+                        'Pocket': best_pocket if best_pocket is not None else '',
+                        'Pocket_Index': best_pocket_index if best_pocket_index is not None else '',
+                        'Affinity': best_score,
+                        'Output_Dir': best_output_dir
                     })
                 else:
-                    print("  ✗ 对接失败或无法解析得分")
+                    print("  ✗ 所有口袋对接均失败或无法解析得分")
 
         results_df = pd.DataFrame(results)
         results_file = self.results_dir / 'docking_results.csv'
         results_df.to_csv(results_file, index=False, encoding='utf-8-sig')
+
+        enum_enable = bool(self.config.get('ligand_enumeration_enable', False))
+        if enum_enable and (not results_df.empty) and ('Ligand_Variant' in results_df.columns):
+            has_variants = (results_df['Ligand_Variant'].astype(str).str.strip() != '').any()
+            if has_variants:
+                try:
+                    grouped = results_df.dropna(subset=['Affinity']).copy()
+                    idx = grouped.groupby(['Receptor', 'Receptor_ID', 'Ligand'])['Affinity'].idxmin()
+                    best_df = grouped.loc[idx].reset_index(drop=True)
+                    best_file = self.results_dir / 'docking_results_best.csv'
+                    best_df.to_csv(best_file, index=False, encoding='utf-8-sig')
+                    print(f"最佳变体结果已保存至: {best_file}")
+                    results_df = best_df
+                except Exception:
+                    pass
 
         print("\n" + "=" * 60)
         print(f"批量对接完成！成功对接: {len(results)}/{total_dockings}")
@@ -1585,14 +2186,9 @@ class MolecularDocking:
             che_name = str(row.get('CHE', 'ligand')).strip()
             smiles = str(row['SMILES']).strip()
 
-            pdb_file, pdbqt_file = self.prepare_ligand(smiles, che_name)
-            if pdbqt_file:
-                ligands.append({
-                    'name': che_name,
-                    'smiles': smiles,
-                    'pdb': pdb_file,
-                    'pdbqt': pdbqt_file
-                })
+            entries = self.prepare_ligand_entries(smiles, che_name)
+            for ent in entries:
+                ligands.append(ent)
 
         print(f"\n成功准备 {len(ligands)}/{len(ligand_df)} 个配体\n")
         return ligands
@@ -1652,6 +2248,7 @@ class MolecularDocking:
             if pdbqt_file:
                 ligands.append({
                     'name': self._safe_stem(fp),
+                    'parent_name': self._safe_stem(fp),
                     'pdb': raw_file,
                     'pdbqt': pdbqt_file
                 })
@@ -1761,61 +2358,14 @@ class MolecularDocking:
         for idx, row in ligand_df.iterrows():
             che_name = row['CHE'].strip()
             smiles = row['SMILES'].strip()
-            
-            pdb_file, pdbqt_file = self.prepare_ligand(smiles, che_name)
-            if pdbqt_file:
-                ligands.append({
-                    'name': che_name,
-                    'smiles': smiles,
-                    'pdb': pdb_file,
-                    'pdbqt': pdbqt_file
-                })
+
+            entries = self.prepare_ligand_entries(smiles, che_name)
+            for ent in entries:
+                ligands.append(ent)
         
         print(f"\n成功准备 {len(ligands)}/{len(ligand_df)} 个配体\n")
         
-        # 步骤3：批量对接
-        print("步骤 3/3: 执行批量对接")
-        print("-" * 60)
-        results = []
-        total_dockings = len(receptors) * len(ligands)
-        current = 0
-        
-        for receptor in receptors:
-            for ligand in ligands:
-                current += 1
-                print(f"\n[{current}/{total_dockings}] 对接: {receptor['name']} vs {ligand['name']}")
-                
-                output_dir, score = self.run_vina_docking(
-                    receptor['pdbqt'],
-                    ligand['pdbqt'],
-                    receptor['name'],
-                    ligand['name']
-                )
-                
-                if score is not None:
-                    print(f"  ✓ 对接完成，得分: {score:.2f} kcal/mol")
-                    print(f"    结果目录: {output_dir}")
-                    results.append({
-                        'Receptor': receptor['name'],
-                        'Receptor_ID': receptor['id'],
-                        'Ligand': ligand['name'],
-                        'Affinity': score,
-                        'Output_Dir': output_dir
-                    })
-                else:
-                    print(f"  ✗ 对接失败或无法解析得分")
-        
-        # 保存结果
-        results_df = pd.DataFrame(results)
-        results_file = self.results_dir / 'docking_results.csv'
-        results_df.to_csv(results_file, index=False, encoding='utf-8-sig')
-        
-        print("\n" + "="*60)
-        print(f"批量对接完成！成功对接: {len(results)}/{total_dockings}")
-        print(f"结果已保存至: {results_file}")
-        print("="*60 + "\n")
-        
-        return results_df
+        return self._run_docking_matrix(receptors, ligands)
     
     def plot_heatmap(self, results_df: pd.DataFrame, output_base: str = None):
         """
@@ -1833,13 +2383,7 @@ class MolecularDocking:
         print("正在绘制对接结果热图...")
 
         plot_df = results_df.copy()
-        if 'Receptor_ID' in plot_df.columns:
-            plot_df['Receptor_Label'] = plot_df.apply(
-                lambda r: f"{r['Receptor']}_{r['Receptor_ID']}" if pd.notna(r.get('Receptor_ID')) and str(r.get('Receptor_ID')).strip() != '' else str(r.get('Receptor')),
-                axis=1
-            )
-        else:
-            plot_df['Receptor_Label'] = plot_df['Receptor']
+        plot_df['Receptor_Label'] = plot_df['Receptor']
 
         # 创建数据透视表（遇到重复键时取最优亲和力）
         pivot_data = plot_df.pivot_table(
@@ -1900,8 +2444,7 @@ class MolecularDocking:
         plt.figure(figsize=(12, 6))
         
         # 创建标签
-        labels = [f"{row['Ligand']}\nvs\n{row['Receptor']}" 
-                 for _, row in top_results.iterrows()]
+        labels = [f"{row['Ligand']}\nvs\n{row['Receptor']}" for _, row in top_results.iterrows()]
         
         colors = plt.cm.RdYlGn_r(np.linspace(0.3, 0.9, len(top_results)))
         
@@ -1937,7 +2480,7 @@ class MolecularDocking:
 def main():
     """主函数"""
     # 配置文件路径
-    config_file = "docking_config.json"
+    config_file = "docking_config_advanced.json" if os.path.exists("docking_config_advanced.json") else "docking_config.json"
     
     # 创建对接系统实例
     docking_system = MolecularDocking(config_file)

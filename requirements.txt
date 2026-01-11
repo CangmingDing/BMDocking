@@ -5,3 +5,5 @@ seaborn
 requests
 meeko
 rdkit-pypi
+gemmi
+biopython
