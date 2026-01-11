@@ -1,9 +1,9 @@
 {
-  "receptor_csv": "hk2测试.csv",
-  "ligand_csv": "瑞香素测试.csv",
-  "receptor_input_mode": "local",
+  "receptor_csv": "受体测试.csv",
+  "ligand_csv": "配体测试.csv",
+  "receptor_input_mode": "csv",
   "ligand_input_mode": "csv",
-  "receptor_local_path": "/Users/dingtunan/生信分析/批量对接脚本/hif1a/receptors/raw",
+  "receptor_local_path": "./yourpath",
   "ligand_local_path": "",
   "receptor_local_extensions": [".pdb", ".cif", ".mmcif"],
   "ligand_local_extensions": [".pdb", ".mol", ".mol2", ".sdf", ".pdbqt"],
